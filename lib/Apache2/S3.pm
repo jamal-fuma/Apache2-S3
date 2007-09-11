@@ -11,7 +11,7 @@ use Digest::SHA1;
 use Digest::HMAC;
 use POSIX;
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 sub _signature
 {
@@ -23,7 +23,11 @@ sub handler
 {
     my $r = shift;
 
-    return Apache2::Const::DECLINED if $r->proxyreq;
+    return Apache2::Const::DECLINED
+	if $r->proxyreq;
+
+    return Apache2::Const::DECLINED
+	unless $r->method eq 'GET' or $r->dir_config('S3ReadWrite');
 
     my $h = $r->headers_in;
     my $uri = $r->uri;
@@ -40,17 +44,13 @@ sub handler
 	$keySecret ||= $r->dir_config("S3Secret");
 
 	my $path = "/$bucket/$uri";
-	my $date = POSIX::strftime("%a, %d %b %Y %H:%M:%S +0000", gmtime);
 
-	my $toSign = join "\n",
-	    "GET",  # method
-	    "",     # content-md5
-	    "",     # content-type
-	    $date,  # date
-	    $path;  # path
-
-	$h->{Date} = $date;
-	$h->{Authorization} = _signature($keyId, $keySecret, $toSign);
+	$h->{'Authorization'} = _signature $keyId, $keySecret, join "\n",
+	    $r->method,
+	    $h->{'Content-MD5'} || "",
+	    $h->{'Content-Type'} || "",
+	    $h->{'Date'} = POSIX::strftime("%a, %d %b %Y %H:%M:%S +0000", gmtime),
+	    $path;
 
 	$r->proxyreq(1);
 	$r->uri("http://s3.amazonaws.com$path");
@@ -78,6 +78,9 @@ Apache2::S3 - mod_perl library for proxying requests to amazon S3
   PerlSetVar S3Secret bar
   PerlSetVar S3Map '/path/ => amazon.s3.bucket.name'
 
+  # If you want to support non-GET requests
+  PerlSetVar S3ReadWrite 1
+
 =head1 DESCRIPTION
 
 This module will map requests for URLs on your server into proxy
@@ -86,6 +89,22 @@ along the way to permit access to non-public resources.
 
 It doesn't actually do any proxying itself, rather it just adds
 the Authorization header and sets the request up for mod_proxy.
+Therefore you will need to enable mod_proxy like so:
+
+  ProxyRequests on
+
+If you permit modification requests (PUT/DELETE) using the
+S3ReadWrite feature then it is quite important that you protect
+the url from untrusted requests using something like the following
+on Apache 2.2:
+
+  <Proxy *>
+    <LimitExcept GET>
+      Order deny,allow
+      Deny from all
+      Allow from localhost
+    </LimitExcept>
+  </Proxy>
 
 =head1 SEE ALSO
 
