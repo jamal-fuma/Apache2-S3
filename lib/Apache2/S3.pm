@@ -9,14 +9,15 @@ use APR::Table;
 use MIME::Base64;
 use Digest::SHA1;
 use Digest::HMAC;
+use URI::Escape;
 use POSIX;
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
 sub _signature
 {
-    my ($key, $secret, $data) = @_;
-    return "AWS $key:".MIME::Base64::encode_base64(Digest::HMAC::hmac($data, $secret, \&Digest::SHA1::sha1), "");
+    my ($key, $data) = @_;
+    return MIME::Base64::encode_base64(Digest::HMAC::hmac($data, $key, \&Digest::SHA1::sha1), "");
 }
 
 sub handler
@@ -24,40 +25,49 @@ sub handler
     my $r = shift;
 
     return Apache2::Const::DECLINED
-	if $r->proxyreq;
+        if $r->proxyreq;
 
     return Apache2::Const::DECLINED
-	unless $r->method eq 'GET' or $r->dir_config('S3ReadWrite');
+        unless $r->method eq 'GET' or $r->dir_config('S3ReadWrite');
 
     my $h = $r->headers_in;
     my $uri = $r->uri;
 
     my %map = split /\s*(?:,|=>)\s*/, $r->dir_config("S3Map");
 
-    # longest match first
+    # most specific (longest) match first
     foreach my $base (sort { length $b <=> length $a } keys %map)
     {
-	$uri =~ s|^$base/*|| or next;
+        $uri =~ s|^$base/*|| or next;
 
-	my ($bucket, $keyId, $keySecret) = split m|/|, $map{$base};
-	$keyId ||= $r->dir_config("S3Key");
-	$keySecret ||= $r->dir_config("S3Secret");
+        my ($bucket, $keyId, $keySecret) = split m|/|, $map{$base};
+        $keyId ||= $r->dir_config("S3Key");
+        $keySecret ||= $r->dir_config("S3Secret");
 
-	my $path = "/$bucket/$uri";
+        my $expires = time + 60;
 
-	$h->{'Authorization'} = _signature $keyId, $keySecret, join "\n",
-	    $r->method,
-	    $h->{'Content-MD5'} || "",
-	    $h->{'Content-Type'} || "",
-	    $h->{'Date'} = POSIX::strftime("%a, %d %b %Y %H:%M:%S +0000", gmtime),
-	    $path;
+        my $args = $r->args || "";
+        my $path = "/$bucket/$uri";
 
-	$r->proxyreq(1);
-	$r->uri("http://s3.amazonaws.com$path");
-	$r->filename("proxy:http://s3.amazonaws.com$path");
-	$r->handler('proxy-server');
+        my $signature = _signature $keySecret, join "\n",
+            $r->method,
+            $h->{'Content-MD5'} || "",
+            $h->{'Content-Type'} || "",
+            $expires,
+            $path.(length $args ? "?$args" : "");
 
-	return Apache2::Const::OK;
+        $args .= (length $args ? "&" : "").
+            "AWSAccessKeyId=".uri_escape($keyId)."&".
+            "Expires=$expires&".
+            "Signature=".uri_escape($signature);
+
+        $r->proxyreq(1);
+        $r->uri("http://s3.amazonaws.com$path");
+        $r->args($args);
+        $r->filename("proxy:http://s3.amazonaws.com$path");
+        $r->handler('proxy-server');
+
+        return Apache2::Const::OK;
     }
 
     return Apache2::Const::DECLINED;
@@ -88,10 +98,19 @@ requests to the Amazon S3 service, adding authentication headers
 along the way to permit access to non-public resources.
 
 It doesn't actually do any proxying itself, rather it just adds
-the Authorization header and sets the request up for mod_proxy.
-Therefore you will need to enable mod_proxy like so:
+the required authentication fields to the request and sets up mod_proxy
+to handle it.  Therefore you will need to enable mod_proxy like so:
 
   ProxyRequests on
+
+The authentication fields are added to the request as query-string
+parameters (i.e. after the "?"). This approach was chosen in favour
+of using the Authorization header because on Apache version 2.2.6 and
+above mod_cache can be configured to ignore the query string and
+cache the data while there is no way to override that behaviour for
+an Authorization header. To do this, use the following option:
+
+  CacheIgnoreQueryString On
 
 If you permit modification requests (PUT/DELETE) using the
 S3ReadWrite feature then it is quite important that you protect
