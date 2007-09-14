@@ -5,19 +5,28 @@ use warnings;
 
 use Apache2::Const -compile => qw(OK DECLINED);
 use Apache2::RequestRec;
+use Apache2::Filter;
+use Apache2::FilterRec;
 use APR::Table;
+use APR::String;
 use MIME::Base64;
 use Digest::SHA1;
 use Digest::HMAC;
 use URI::Escape;
+use HTML::Entities;
+use XML::Parser;
+use Time::Local;
 use POSIX;
+use CGI;
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
+
+use constant TEXT => '0';
 
 sub _signature
 {
-    my ($key, $data) = @_;
-    return MIME::Base64::encode_base64(Digest::HMAC::hmac($data, $key, \&Digest::SHA1::sha1), "");
+    my ($id, $key, $data) = @_;
+    return "AWS $id:".MIME::Base64::encode_base64(Digest::HMAC::hmac($data, $key, \&Digest::SHA1::sha1), "");
 }
 
 sub handler
@@ -38,39 +47,174 @@ sub handler
     # most specific (longest) match first
     foreach my $base (sort { length $b <=> length $a } keys %map)
     {
-        $uri =~ s|^$base/*|| or next;
+        $uri =~ s|^($base/*)|| or next;
+        my $stripped = $1;
 
         my ($bucket, $keyId, $keySecret) = split m|/|, $map{$base};
         $keyId ||= $r->dir_config("S3Key");
         $keySecret ||= $r->dir_config("S3Secret");
 
-        my $expires = time + 60;
+        my $is_dir = $uri =~ m,(^|/)$,;
+        my $path = "/$bucket/".($is_dir ? "" : $uri);
 
         my $args = $r->args || "";
-        my $path = "/$bucket/$uri";
+        my $sub = $args =~ s/^(acl|logging|torrent)(?:&|$)// ? $1 : "";
+        local $CGI::USE_PARAM_SEMICOLONS = 0;
+        $args = CGI->new($r, $args);
 
-        my $signature = _signature $keySecret, join "\n",
+        if ($is_dir)
+        {
+            $args->param('delimiter', $args->param('delimiter') || '/');
+            $args->param('prefix', $uri) if $uri;
+        }
+
+        $h->{'Date'} = POSIX::strftime("%a, %d %b %Y %H:%M:%S +0000", gmtime);
+        $h->{'Authorization'} = _signature $keyId, $keySecret, join "\n",
             $r->method,
             $h->{'Content-MD5'} || "",
             $h->{'Content-Type'} || "",
-            $expires,
-            $path.(length $args ? "?$args" : "");
-
-        $args .= (length $args ? "&" : "").
-            "AWSAccessKeyId=".uri_escape($keyId)."&".
-            "Expires=$expires&".
-            "Signature=".uri_escape($signature);
+            $h->{'Date'},
+            $path.($sub ? "?$sub" : "");
 
         $r->proxyreq(1);
         $r->uri("http://s3.amazonaws.com$path");
-        $r->args($args);
+        $r->args(($sub ? "$sub&" : "").$args->query_string);
         $r->filename("proxy:http://s3.amazonaws.com$path");
         $r->handler('proxy-server');
+
+        $r->notes->add(__PACKAGE__.'::s3_stripped' => $stripped);
+        $r->notes->add(__PACKAGE__.'::s3_prefix' => $uri);
+        $r->notes->add(__PACKAGE__.'::s3_raw' => 1)
+            if $args->param('raw') or not $is_dir or $sub;
+        $r->notes->add(__PACKAGE__.'::s3_nocache' => 1)
+            if $args->param('nocache') or $is_dir or $sub;
+
+        $r->add_output_filter(\&output_filter);
 
         return Apache2::Const::OK;
     }
 
     return Apache2::Const::DECLINED;
+}
+
+sub _xml_get_tags
+{
+    my ($tree, $tag, @tags) = @_;
+    my @ret;
+    for (my $i = @$tree % 2; $i < @$tree; $i += 2)
+    {
+        next unless $tree->[$i] eq $tag;
+        push @ret, $tree->[$i+1];
+        last unless wantarray;
+    }
+    return unless @ret;
+    return _xml_get_tags($ret[0], @tags) if @tags;
+    return wantarray ? @ret : $ret[0];
+}
+
+sub _reformat_directory
+{
+    my ($f, $ctx) = @_;
+
+    my $stripped = $f->r->notes->get(__PACKAGE__.'::s3_stripped');
+    my $prefix = $f->r->notes->get(__PACKAGE__.'::s3_prefix');
+
+    my $tree = eval {
+        XML::Parser->new(Style => 'Tree')->parse($ctx->{text});
+    };
+
+    my $list = _xml_get_tags($tree, 'ListBucketResult')
+        or die $ctx->{text};
+
+    my $is_truncated = _xml_get_tags($list, 'IsTruncated', TEXT) =~ /^(?:false|)$/i ? 0 : 1;
+
+    my @dirs = map +{
+        Name         => _xml_get_tags($_, 'Prefix', TEXT),
+    }, _xml_get_tags($list, 'CommonPrefixes');
+
+    my @files = map +{
+        Name         => _xml_get_tags($_, 'Key', TEXT),
+        Size         => _xml_get_tags($_, 'Size', TEXT),
+        LastModified => _xml_get_tags($_, 'LastModified', TEXT) =~
+            /^(\d\d\d\d)-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?Z$/
+                ? timegm($6, $5, $4, $3, $2-1, $1) : 0,
+    }, _xml_get_tags($list, 'Contents');
+
+    my $ret = "";
+
+    $ret .= qq|<html><body><pre>|;
+
+    $ret .= qq|<a href="|.("$stripped$prefix" =~ m|^(.*/)[^/]+/$| ? $1 : "/").qq|">Parent Directory</a>\n|;
+
+    $ret .= qq|<a href="?marker=|.(uri_escape $files[-1]{Name}).qq|">Next Page</a>\n|
+        if $is_truncated;
+
+    $ret .= sprintf(qq|<a href="%s">%s</a>%s %-18s %s\n|,
+            $_->{Link},
+            $_->{DisplayName},
+            " "x(87 - length $_->{DisplayName}),
+            $_->{LastModified} ? strftime("%d-%b-%Y %H:%M", localtime($_->{LastModified})) : "-",
+            $_->{Size} ? APR::String::format_size($_->{Size}) : "")
+        foreach map {
+            $_->{Link} = HTML::Entities::encode("$stripped$_->{Name}");
+            $_->{DisplayName} = $_->{Name} =~ m|([^/]+)/?$| ? $1 : $_->{Name};
+            $_;
+        } @dirs, @files;
+
+    $ret .= qq|</pre></body></html>|;
+
+    $ret;
+}
+
+sub output_filter
+{
+    my $f = shift;
+
+    my $ctx;
+
+    unless ($ctx = $f->ctx)
+    {
+        # disable caching layer if requested
+        if ($f->r->notes->get(__PACKAGE__.'::s3_nocache'))
+        {
+            my $next = $f;
+
+            while ($next)
+            {
+                $next->remove if $next->frec->name =~ /^cache_\w+$/i;
+                $next = $next->next;
+            }
+        }
+
+        # mark as public to allow mod_cache to save it even though it includes an Authorization header
+        $f->r->headers_out->{'Cache-Control'} = join(",", grep defined && length,
+            split(/\s*,\s*/, $f->r->headers_out->{'Cache-Control'} || ""), "public");
+
+        # don't process this output if requested
+        if ($f->r->notes->get(__PACKAGE__.'::s3_raw') or lc $f->r->content_type ne 'application/xml')
+        {
+            $f->remove;
+            return Apache2::Const::DECLINED
+        }
+
+        $f->r->content_type('text/html');
+        $f->r->headers_out->unset('Content-Length');
+        $f->ctx($ctx = { text => "" })
+    }
+
+    $ctx->{text} .= $_
+        while $f->read($_);
+
+    return Apache2::Const::OK
+        unless $f->seen_eos;
+
+    my $ret = _reformat_directory($f, $ctx);
+
+    $f->r->headers_out->{'Content-Length'} = length $ret;
+    $f->print($ret);
+    $f->ctx(undef);
+
+    return Apache2::Const::OK;
 }
 
 1;
@@ -102,15 +246,6 @@ the required authentication fields to the request and sets up mod_proxy
 to handle it.  Therefore you will need to enable mod_proxy like so:
 
   ProxyRequests on
-
-The authentication fields are added to the request as query-string
-parameters (i.e. after the "?"). This approach was chosen in favour
-of using the Authorization header because on Apache version 2.2.6 and
-above mod_cache can be configured to ignore the query string and
-cache the data while there is no way to override that behaviour for
-an Authorization header. To do this, use the following option:
-
-  CacheIgnoreQueryString On
 
 If you permit modification requests (PUT/DELETE) using the
 S3ReadWrite feature then it is quite important that you protect
