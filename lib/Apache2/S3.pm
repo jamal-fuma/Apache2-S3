@@ -3,7 +3,7 @@ package Apache2::S3;
 use strict;
 use warnings;
 
-use Apache2::Const -compile => qw(OK DECLINED);
+use Apache2::Const -compile => qw(OK DECLINED PROXYREQ_REVERSE);
 use Apache2::RequestRec;
 use Apache2::Filter;
 use Apache2::FilterRec;
@@ -19,7 +19,9 @@ use Time::Local;
 use POSIX;
 use CGI;
 
-our $VERSION = '0.04';
+our $VERSION = '0.05';
+
+our $ESCAPE = quotemeta " #%<>[\]^`{|}?\\";
 
 use constant TEXT => '0';
 
@@ -68,33 +70,58 @@ sub handler
             $args->param('prefix', $uri) if $uri;
         }
 
-        $h->{'Date'} = POSIX::strftime("%a, %d %b %Y %H:%M:%S +0000", gmtime);
-        $h->{'Authorization'} = _signature $keyId, $keySecret, join "\n",
-            $r->method,
-            $h->{'Content-MD5'} || "",
-            $h->{'Content-Type'} || "",
-            $h->{'Date'},
-            $path.($sub ? "?$sub" : "");
+        my %note = (
+            'id'       => $keyId,
+            'secret'   => $keySecret,
+            'path'     => $path,
+            'sub'      => $sub,
+            'stripped' => $stripped,
+            ($is_dir ? ('prefix' => $uri) : ()),
+            (($args->param('raw') or not $is_dir or $sub) ? ('raw' => 1) : ()),
+            (($args->param('nocache') or $is_dir or $sub) ? ('nocache' => 1) : ()),
+        );
 
-        $r->proxyreq(1);
+        $r->notes->add(__PACKAGE__."::s3_$_" => $note{$_})
+            foreach keys %note;
+
+        $r->proxyreq(Apache2::Const::PROXYREQ_REVERSE);
         $r->uri("http://s3.amazonaws.com$path");
         $r->args(($sub ? "$sub&" : "").$args->query_string);
         $r->filename("proxy:http://s3.amazonaws.com$path");
         $r->handler('proxy-server');
 
-        $r->notes->add(__PACKAGE__.'::s3_stripped' => $stripped);
-        $r->notes->add(__PACKAGE__.'::s3_prefix' => $uri);
-        $r->notes->add(__PACKAGE__.'::s3_raw' => 1)
-            if $args->param('raw') or not $is_dir or $sub;
-        $r->notes->add(__PACKAGE__.'::s3_nocache' => 1)
-            if $args->param('nocache') or $is_dir or $sub;
+        # we delay adding the authorization header to give
+        # mod_auth* a chance to authenticate the users request
+        # which would use the same header
+        $r->set_handlers('PerlFixupHandler' => \&s3_auth_handler);
 
+        # we set up an output filter to translate XML responses
+        # for directory requests into "pretty" HTML
         $r->add_output_filter(\&output_filter);
 
         return Apache2::Const::OK;
     }
 
     return Apache2::Const::DECLINED;
+}
+
+sub s3_auth_handler
+{
+    my $r = shift;
+    my $h = $r->headers_in;
+
+    my ($keyId, $keySecret, $path, $sub) =
+        map $r->notes->get(__PACKAGE__."::s3_$_"), qw(id secret path sub);
+
+    $h->{'Date'} = POSIX::strftime("%a, %d %b %Y %H:%M:%S +0000", gmtime);
+    $h->{'Authorization'} = _signature $keyId, $keySecret, join "\n",
+        $r->method,
+        $h->{'Content-MD5'} || "",
+        $h->{'Content-Type'} || "",
+        $h->{'Date'},
+        uri_escape($path, $ESCAPE).($sub ? "?$sub" : "");
+
+    return Apache2::Const::OK;
 }
 
 sub _xml_get_tags
@@ -127,6 +154,7 @@ sub _reformat_directory
         or die $ctx->{text};
 
     my $is_truncated = _xml_get_tags($list, 'IsTruncated', TEXT) =~ /^(?:false|)$/i ? 0 : 1;
+    my $next_marker = _xml_get_tags($list, 'NextMarker', TEXT);
 
     my @dirs = map +{
         Name         => _xml_get_tags($_, 'Prefix', TEXT),
@@ -146,17 +174,16 @@ sub _reformat_directory
 
     $ret .= qq|<a href="|.("$stripped$prefix" =~ m|^(.*/)[^/]+/$| ? $1 : "/").qq|">Parent Directory</a>\n|;
 
-    $ret .= qq|<a href="?marker=|.(uri_escape $files[-1]{Name}).qq|">Next Page</a>\n|
-        if $is_truncated;
+    $ret .= qq|<a href="?marker=|.(uri_escape $next_marker).qq|">Next Page</a>\n|
+        if $is_truncated and $next_marker;
 
     $ret .= sprintf(qq|<a href="%s">%s</a>%s %-18s %s\n|,
-            $_->{Link},
-            $_->{DisplayName},
+            $stripped.uri_escape($_->{Name}, $ESCAPE),
+            HTML::Entities::encode($_->{DisplayName}),
             " "x(87 - length $_->{DisplayName}),
             $_->{LastModified} ? strftime("%d-%b-%Y %H:%M", localtime($_->{LastModified})) : "-",
             $_->{Size} ? APR::String::format_size($_->{Size}) : "")
         foreach map {
-            $_->{Link} = HTML::Entities::encode("$stripped$_->{Name}");
             $_->{DisplayName} = $_->{Name} =~ m|([^/]+)/?$| ? $1 : $_->{Name};
             $_;
         } @dirs, @files;
@@ -185,15 +212,24 @@ sub output_filter
                 $next = $next->next;
             }
         }
-
-        # mark as public to allow mod_cache to save it even though it includes an Authorization header
-        $f->r->headers_out->{'Cache-Control'} = join(",", grep defined && length,
-            split(/\s*,\s*/, $f->r->headers_out->{'Cache-Control'} || ""), "public");
+        else
+        {
+            # mark as public to allow mod_cache to save it even though it includes an Authorization header
+            $f->r->headers_out->{'Cache-Control'} = join(",", grep defined && length,
+                split(/\s*,\s*/, $f->r->headers_out->{'Cache-Control'} || ""), "public");
+        }
 
         # don't process this output if requested
         if ($f->r->notes->get(__PACKAGE__.'::s3_raw') or lc $f->r->content_type ne 'application/xml')
         {
             $f->remove;
+
+	    unless ($f->r->content_type eq 'application/xml')
+	    {
+		# S3 supports byte-range requests, but doesn't advertise it.
+		$f->r->headers_out->{'Accept-Ranges'} = 'bytes';
+	    }
+
             return Apache2::Const::DECLINED
         }
 
