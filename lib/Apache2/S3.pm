@@ -57,7 +57,8 @@ sub handler
         $keySecret ||= $r->dir_config("S3Secret");
 
         my $is_dir = $uri =~ m,(^|/)$,;
-        my $path = "/$bucket/".($is_dir ? "" : $uri);
+        my $bucket_path = "$bucket.s3.amazonaws.com/".($is_dir ? "" : $uri);
+        my $signing_path = "/$bucket/".($is_dir ? "" : $uri);
 
         my $args = $r->args || "";
         my $sub = $args =~ s/^(acl|logging|torrent)(?:&|$)// ? $1 : "";
@@ -71,11 +72,12 @@ sub handler
         }
 
         my %note = (
-            'id'       => $keyId,
-            'secret'   => $keySecret,
-            'path'     => $path,
-            'sub'      => $sub,
-            'stripped' => $stripped,
+            'id'       		=> $keyId,
+            'secret'  		=> $keySecret,
+            'bucket_path'     	=> $bucket_path,
+            'signing_path'    	=> $signing_path,
+            'sub'      		=> $sub,
+            'stripped'		=> $stripped,
             ($is_dir ? ('prefix' => $uri) : ()),
             (($args->param('raw') or not $is_dir or $sub) ? ('raw' => 1) : ()),
             (($args->param('nocache') or $is_dir or $sub) ? ('nocache' => 1) : ()),
@@ -85,9 +87,9 @@ sub handler
             foreach keys %note;
 
         $r->proxyreq(Apache2::Const::PROXYREQ_REVERSE);
-        $r->uri("http://s3.amazonaws.com$path");
+        $r->uri("http://$bucket_path");
         $r->args(($sub ? "$sub&" : "").$args->query_string);
-        $r->filename("proxy:http://s3.amazonaws.com$path");
+        $r->filename("proxy:http://$bucket_path");
         $r->handler('proxy-server');
 
         # we delay adding the authorization header to give
@@ -111,7 +113,7 @@ sub s3_auth_handler
     my $h = $r->headers_in;
 
     my ($keyId, $keySecret, $path, $sub) =
-        map $r->notes->get(__PACKAGE__."::s3_$_"), qw(id secret path sub);
+        map $r->notes->get(__PACKAGE__."::s3_$_"), qw(id secret signing_path sub);
 
     $h->{'Date'} = POSIX::strftime("%a, %d %b %Y %H:%M:%S +0000", gmtime);
     $h->{'Authorization'} = _signature $keyId, $keySecret, join "\n",
